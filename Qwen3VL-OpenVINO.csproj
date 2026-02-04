@@ -1,0 +1,29 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.12" />
+    <PackageReference Include="SixLabors.ImageSharp.Drawing" Version="2.1.7" />
+    <PackageReference Include="Microsoft.ML.Tokenizers" Version="2.0.0" />
+    <PackageReference Include="Tokenizers.HuggingFace" Version="2.21.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="C:\Program Files (x86)\Intel\openvino_2025\runtime\bin\intel64\Release\*.dll">
+      <Link>%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="C:\Program Files (x86)\Intel\openvino_2025\runtime\3rdparty\tbb\bin\*.dll">
+      <Link>%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>

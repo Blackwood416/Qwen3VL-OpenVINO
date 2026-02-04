@@ -1,0 +1,62 @@
+[Aa]bin/
+[Aa]obj/
+[Aa]pp/
+[Aa]App/
+[Aa]ppData/
+[Aa]pp_Data/
+[Aa]pp_LocalResources/
+[Aa]pp_GlobalResources/
+[Aa]pp_Themes/
+[Aa]pp_Browsers/
+[Aa]pp_Plugins/
+[Aa]pp_Config/
+[Aa]pp_Templates/
+[Aa]pp_Workflows/
+[Aa]pp_WebServices/
+[Aa]pp_Web/
+[Aa]pp_Services/
+[Aa]pp_Models/
+[Aa]pp_Controllers/
+[Aa]pp_Views/
+[Aa]pp_Scripts/
+[Aa]pp_Content/
+[Aa]pp_Fonts/
+[Aa]pp_Images/
+[Aa]pp_Sounds/
+[Aa]pp_Videos/
+[Aa]pp_Files/
+[Aa]pp_Logs/
+[Aa]pp_Errors/
+[Aa]pp_Cache/
+
+# .NET Core / .NET 5+
+bin/
+obj/
+out/
+[Dd]ebug/
+[Rr]elease/
+
+# Visual Studio
+.vs/
+*.user
+*.userosscache
+*.sln.docstates
+
+# Rider
+.idea/
+*.sln.iml
+
+# User specific
+cache/
+*.log
+
+# NuGet
+packages/
+*.nupkg
+# Don't ignore NuGet.Config if it's there
+# !NuGet.Config
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
