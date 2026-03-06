@@ -36,6 +36,11 @@ out/
 [Dd]ebug/
 [Rr]elease/
 
+# Databases
+*.shm
+*.wal
+*.db
+
 # Visual Studio
 .vs/
 *.user
@@ -48,6 +53,8 @@ out/
 
 # User specific
 cache/
+uploads/
+sessions/
 *.log
 
 # NuGet

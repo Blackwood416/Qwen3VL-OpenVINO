@@ -6,6 +6,7 @@ using SixLabors.ImageSharp.Processing;
 using System.Runtime.InteropServices;
 using System.Linq;
 using System.Collections.Generic;
+using System.Diagnostics;
 using Tokenizers.HuggingFace.Tokenizer;
 
 namespace Qwen3VL;
@@ -41,6 +42,14 @@ public class Qwen3VLPipeline : IDisposable
     private int _visionHiddenSize = 1024; // Default fallback
     private int _visionRoPEDim = 32; // Default fallback (4B), 8B is 36
     private Random _rng = new Random();
+
+    public struct GenerationStats
+    {
+        public double PrefillMs { get; set; }
+        public double DecodeMs { get; set; }
+        public int TokenCount { get; set; }
+        public double TokensPerSecond => TokenCount > 0 && DecodeMs > 0 ? (TokenCount / (DecodeMs / 1000.0)) : 0;
+    }
 
     // High Performance Sampling Buffers
     private struct LogitCandidate
@@ -97,18 +106,67 @@ public class Qwen3VLPipeline : IDisposable
 
     private void Warmup()
     {
-        Console.WriteLine("[Info] Warming up Qwen3-VL Pipeline (Pre-loading kernels)...");
+        Console.WriteLine("[Info] Warming up (pre-compiling GPU kernels)...");
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
-            // Run a very short generate to ensure all GPU kernels are cached/ready
-            var session = StartSession();
-            session.Chat("Warmup.", silent: true);
+            // Minimal warmup like llama.cpp: push 1 token through text embedding
+            // then 1 token through LLM to trigger GPU kernel compilation.
+            float[] emb = GetEmbeddings(new int[] { 151643 });
+
+            // LLM warmup: single-token prefill to compile kernels
+            int hiddenSize = _hiddenSize;
+            CheckStatus(NativeMethods.ov_compiled_model_create_infer_request(_languageCompiled, out var warmupInfer), "Warmup LLM infer");
+
+            CheckStatus(NativeMethods.ov_shape_create(3, new long[] { 1, 1, hiddenSize }, out var eShape), "wE shape");
+            var hE = System.Runtime.InteropServices.GCHandle.Alloc(emb, System.Runtime.InteropServices.GCHandleType.Pinned);
+            CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.F32, eShape, hE.AddrOfPinnedObject(), out var tE), "wE tensor");
+
+            CheckStatus(NativeMethods.ov_shape_create(3, new long[] { 3, 1, 1 }, out var pShape), "wP shape");
+            var posIds = new long[] { 0, 0, 0 };
+            var hP = System.Runtime.InteropServices.GCHandle.Alloc(posIds, System.Runtime.InteropServices.GCHandleType.Pinned);
+            CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.I64, pShape, hP.AddrOfPinnedObject(), out var tP), "wP tensor");
+
+            CheckStatus(NativeMethods.ov_shape_create(2, new long[] { 1, 1 }, out var mShape), "wM shape");
+            var maskArr = new long[] { 1 };
+            var hM = System.Runtime.InteropServices.GCHandle.Alloc(maskArr, System.Runtime.InteropServices.GCHandleType.Pinned);
+            CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.I64, mShape, hM.AddrOfPinnedObject(), out var tM), "wM tensor");
+
+            CheckStatus(NativeMethods.ov_shape_create(2, new long[] { 1, 1 }, out var vShape), "wV shape");
+            var vmArr = new bool[] { false };
+            var hV = System.Runtime.InteropServices.GCHandle.Alloc(vmArr, System.Runtime.InteropServices.GCHandleType.Pinned);
+            CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.BOOL, vShape, hV.AddrOfPinnedObject(), out var tV), "wV tensor");
+
+            CheckStatus(NativeMethods.ov_shape_create(3, new long[] { 3, 0, hiddenSize }, out var dShape), "wD shape");
+            CheckStatus(NativeMethods.ov_tensor_create(OvElementType.F32, dShape, out var tD), "wD tensor");
+
+            CheckStatus(NativeMethods.ov_shape_create(1, new long[] { 1 }, out var bShape), "wB shape");
+            var beamArr = new int[] { 0 };
+            var hB = System.Runtime.InteropServices.GCHandle.Alloc(beamArr, System.Runtime.InteropServices.GCHandleType.Pinned);
+            CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.I32, bShape, hB.AddrOfPinnedObject(), out var tB), "wB tensor");
+
+            CheckStatus(NativeMethods.ov_infer_request_set_tensor(warmupInfer, "inputs_embeds", tE), "wSet E");
+            CheckStatus(NativeMethods.ov_infer_request_set_tensor(warmupInfer, "position_ids", tP), "wSet P");
+            CheckStatus(HandleAttnMask(warmupInfer, tM), "wSet M");
+            CheckStatus(NativeMethods.ov_infer_request_set_tensor(warmupInfer, "deepstack_visual_embeds", tD), "wSet D");
+            CheckStatus(NativeMethods.ov_infer_request_set_tensor(warmupInfer, "visual_pos_masks", tV), "wSet V");
+            CheckStatus(NativeMethods.ov_infer_request_set_tensor(warmupInfer, "beam_idx", tB), "wSet B");
+
+            CheckStatus(NativeMethods.ov_infer_request_infer(warmupInfer), "Warmup LLM infer run");
+
+            // Cleanup warmup resources
+            hE.Free(); hP.Free(); hM.Free(); hV.Free(); hB.Free();
+            NativeMethods.ov_tensor_free(tE); NativeMethods.ov_tensor_free(tP);
+            NativeMethods.ov_tensor_free(tM); NativeMethods.ov_tensor_free(tV);
+            NativeMethods.ov_tensor_free(tD); NativeMethods.ov_tensor_free(tB);
+            NativeMethods.ov_infer_request_free(warmupInfer);
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Warning] Warmup skipped: {ex.Message}");
+            Console.WriteLine($"[Warning] Warmup issue (non-fatal): {ex.Message}");
         }
-        Console.WriteLine("[Info] Warmup complete.");
+        sw.Stop();
+        Console.WriteLine($"[Info] Warmup complete in {sw.Elapsed.TotalMilliseconds:F0}ms.");
     }
 
     private nint LoadPart(string xmlName)
@@ -141,7 +199,7 @@ public class Qwen3VLPipeline : IDisposable
                     "EXECUTION_MODE_HINT", "PERFORMANCE",
                     "PERFORMANCE_HINT_NUM_REQUESTS", "1",
                     "GPU_HOST_TASK_PRIORITY", "HIGH",
-                    "GPU_QUEUE_PRIORITY", "HIGH");
+                    "KV_CACHE_PRECISION", "u8");
             }
             else
             {
@@ -156,7 +214,19 @@ public class Qwen3VLPipeline : IDisposable
         }
         else
         {
-            status = NativeMethods.ov_core_compile_model(_core, model, device, 0, out compiled);
+            if (isLLM)
+            {
+                status = NativeMethods.ov_core_compile_model_props5(_core, model, device, 10, out compiled,
+                    "PERFORMANCE_HINT", "LATENCY",
+                    "INFERENCE_PRECISION_HINT", "f16",
+                    "CACHE_DIR", "./cache",
+                    "NUM_STREAMS", "1",
+                    "KV_CACHE_PRECISION", "u8");
+            }
+            else
+            {
+                status = NativeMethods.ov_core_compile_model(_core, model, device, 0, out compiled);
+            }
         }
 
         if (status != OvStatus.OK) CheckStatus(status, $"Compile model (isLLM={isLLM})");
@@ -200,12 +270,15 @@ public class Qwen3VLPipeline : IDisposable
 
         private string? _systemPrompt;
         private List<TurnData> _history = new List<TurnData>();
+        public string? Title { get; set; }
         private HashSet<int> _uniqueIds = new HashSet<int>();
 
         public class TurnData
         {
             public string Prompt { get; set; } = "";
             public string? ImagePath { get; set; }
+            public string? VideoPath { get; set; }
+            public int MaxVideoFrames { get; set; } = 8;
             public List<int> GeneratedIds { get; set; } = new List<int>();
         }
 
@@ -215,7 +288,7 @@ public class Qwen3VLPipeline : IDisposable
             CheckStatus(NativeMethods.ov_compiled_model_create_infer_request(_pipeline._languageCompiled, out _llmInfer), "Create LLM infer");
         }
 
-        public List<int> Chat(string prompt, string? imagePath = null, GenerationConfig? config = null, bool silent = false, CancellationToken ct = default)
+        public List<int> Chat(string prompt, string? imagePath = null, string? videoPath = null, int maxVideoFrames = 8, GenerationConfig? config = null, bool silent = false, CancellationToken ct = default, Action<string>? onToken = null, Action<GenerationStats>? onStats = null)
         {
             var overallSw = System.Diagnostics.Stopwatch.StartNew();
             double visualMs = 0;
@@ -228,20 +301,31 @@ public class Qwen3VLPipeline : IDisposable
                 nint visualEmbedsTensor = 0;
                 nint deepstackFeaturesTensor = 0;
                 int numVisualTokens = 0;
-                int gridH = 0, gridW = 0;
-
-                if (imagePath != null)
+                int gridT = 0, gridH = 0, gridW = 0;
+                int vIdBase = -1;
+                if (videoPath != null && File.Exists(videoPath))
                 {
                     var vsw = System.Diagnostics.Stopwatch.StartNew();
-                    (visualEmbedsTensor, deepstackFeaturesTensor, _, gridH, gridW) = _pipeline.ProcessImage(imagePath);
+                    (visualEmbedsTensor, deepstackFeaturesTensor, gridT, gridH, gridW) = _pipeline.ProcessVideo(videoPath, maxVideoFrames, silent);
                     vsw.Stop();
                     visualMs = vsw.Elapsed.TotalMilliseconds;
+                    if (!silent) Console.WriteLine($"[Info] ProcessVideo: {videoPath}, frames={gridT}");
+                }
+                else if (imagePath != null && File.Exists(imagePath))
+                {
+                    var vsw = System.Diagnostics.Stopwatch.StartNew();
+                    (visualEmbedsTensor, deepstackFeaturesTensor, gridT, gridH, gridW) = _pipeline.ProcessImage(imagePath, silent);
+                    vsw.Stop();
+                    visualMs = vsw.Elapsed.TotalMilliseconds;
+                }
 
+                if (visualEmbedsTensor != 0)
+                {
                     CheckStatus(NativeMethods.ov_tensor_get_shape(visualEmbedsTensor, out var vShape), "Get vShape");
                     long[] dims = _pipeline.GetShapeDims(vShape);
                     NativeMethods.ov_shape_free(ref vShape);
                     numVisualTokens = (int)(dims.Length == 3 ? dims[1] : dims[0]);
-                    if (!silent) Console.WriteLine($"[Debug] ProcessImage: numVisualTokens={numVisualTokens}, gridH={gridH}, gridW={gridW}");
+                    if (!silent) Console.WriteLine($"[Debug] ProcessVision: numVisualTokens={numVisualTokens}, gridT={gridT}, gridH={gridH}, gridW={gridW}");
                 }
 
                 // 1. Construct Turn Tokens
@@ -249,48 +333,53 @@ public class Qwen3VLPipeline : IDisposable
                 turnIds.AddRange(_pipeline._tokenizer.Encode("<|im_start|>user\n", addSpecialTokens: false).First().Ids.Select(x => (int)x));
 
                 int visualStartIdx = -1;
-                if (imagePath != null)
+                if (numVisualTokens > 0)
                 {
                     visualStartIdx = turnIds.Count;
                     turnIds.AddRange(_pipeline._tokenizer.Encode("<|vision_start|>", addSpecialTokens: false).First().Ids.Select(x => (int)x));
-                    for (int i = 0; i < numVisualTokens; i++) turnIds.Add(0); // Placeholder
+                    int padToken = videoPath != null ? 151656 : 151655; // <|video_pad|> or <|image_pad|>
+                    for (int i = 0; i < numVisualTokens; i++) turnIds.Add(padToken);
                     turnIds.AddRange(_pipeline._tokenizer.Encode("<|vision_end|>", addSpecialTokens: false).First().Ids.Select(x => (int)x));
                 }
 
                 turnIds.AddRange(_pipeline._tokenizer.Encode($"{prompt}<|im_end|>\n<|im_start|>assistant\n", addSpecialTokens: false).First().Ids.Select(x => (int)x));
+
+                vIdBase = (numVisualTokens > 0 && visualStartIdx != -1) ? (visualStartIdx + _pipeline._tokenizer.Encode("<|vision_start|>", addSpecialTokens: false).First().Ids.Count) : -1;
 
                 int totalTurnTokens = turnIds.Count;
                 foreach (var id in turnIds) _uniqueIds.Add(id); float[] inputsEmbedsArr = _pipeline.GetEmbeddings(turnIds.ToArray());
                 long[] positionIdsArr = new long[3 * totalTurnTokens];
                 bool[] currentTurnVisualMasks = new bool[totalTurnTokens];
 
-                if (imagePath != null && visualStartIdx != -1)
+                if (visualEmbedsTensor != 0 && visualStartIdx != -1)
                 {
-                    int vIdStart = visualStartIdx + _pipeline._tokenizer.Encode("<|vision_start|>", addSpecialTokens: false).First().Ids.Count;
                     CheckStatus(NativeMethods.ov_tensor_data(visualEmbedsTensor, out nint vPtr), "vPtr");
                     int copyLen = numVisualTokens * hiddenSize;
-                    if ((vIdStart + numVisualTokens) * hiddenSize <= inputsEmbedsArr.Length)
+                    if (vIdBase >= 0 && (vIdBase + numVisualTokens) * hiddenSize <= inputsEmbedsArr.Length)
                     {
-                        Marshal.Copy(vPtr, inputsEmbedsArr, vIdStart * hiddenSize, copyLen);
+                        Marshal.Copy(vPtr, inputsEmbedsArr, vIdBase * hiddenSize, copyLen);
                     }
 
+                    int llmGridH = gridH;
+                    int llmGridW = gridW;
                     for (int i = 0; i < numVisualTokens; i++)
                     {
-                        int idx = vIdStart + i;
-                        currentTurnVisualMasks[idx] = true;
-                        positionIdsArr[0 * totalTurnTokens + idx] = _totalTemporal;
-                        positionIdsArr[1 * totalTurnTokens + idx] = (i / gridW);
-                        positionIdsArr[2 * totalTurnTokens + idx] = i % gridW;
+                        int idx = vIdBase + i;
+                        if (idx >= 0 && idx < totalTurnTokens)
+                        {
+                            currentTurnVisualMasks[idx] = true;
+                            positionIdsArr[0 * totalTurnTokens + idx] = _totalTemporal + (i / (llmGridH * llmGridW));
+                            positionIdsArr[1 * totalTurnTokens + idx] = _totalTemporal + ((i / llmGridW) % llmGridH);
+                            positionIdsArr[2 * totalTurnTokens + idx] = _totalTemporal + (i % llmGridW);
+                        }
                     }
                 }
 
-                // Synchronize global visual masks
-                _sessionVisualMasks.AddRange(currentTurnVisualMasks);
+                // Synchronize global visual masks - MOVED TO END of prefill to avoid duplication
 
                 int currentT = _totalTemporal;
                 bool inVision = false;
                 int vTokensHandled = 0;
-                int vIdBase = (imagePath != null && visualStartIdx != -1) ? (visualStartIdx + _pipeline._tokenizer.Encode("<|vision_start|>", addSpecialTokens: false).First().Ids.Count) : -1;
 
                 for (int i = 0; i < totalTurnTokens; i++)
                 {
@@ -306,94 +395,121 @@ public class Qwen3VLPipeline : IDisposable
                     if (inVision)
                     {
                         vTokensHandled++;
-                        if (vTokensHandled >= numVisualTokens) inVision = false;
+                        if (vTokensHandled >= numVisualTokens)
+                        {
+                            inVision = false;
+                            currentT += (gridT > 0 ? gridT : 1);
+                        }
                     }
                     else currentT++;
                 }
 
                 if (!silent) Console.WriteLine($"[Debug] Prefill: totalPhysical={_totalPhysical + totalTurnTokens}, totalTemporal={currentT}, turnTokens={totalTurnTokens}");
 
-                // 2. Tensors for Pre-fill
-                CheckStatus(NativeMethods.ov_shape_create((nuint)3, new long[] { 1, totalTurnTokens, (long)hiddenSize }, out var ovEmbedShape), "Embed shape");
-                GCHandle hEmbed = GCHandle.Alloc(inputsEmbedsArr, GCHandleType.Pinned);
-                CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.F32, ovEmbedShape, hEmbed.AddrOfPinnedObject(), out var tEmbed), "Embed tensor");
-
-                CheckStatus(NativeMethods.ov_shape_create((nuint)3, new long[] { 3, 1, totalTurnTokens }, out var ovPosShape), "Pos shape");
-                GCHandle hPos = GCHandle.Alloc(positionIdsArr, GCHandleType.Pinned);
-                CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.I64, ovPosShape, hPos.AddrOfPinnedObject(), out var tPos), "Pos tensor");
-
-                int fullMaskLen = _totalPhysical + totalTurnTokens;
-                CheckStatus(NativeMethods.ov_shape_create((nuint)2, new long[] { 1, fullMaskLen }, out var ovMaskShape), "Mask shape");
-                long[] fullMask = Enumerable.Repeat(1L, fullMaskLen).ToArray();
-                GCHandle hMask = GCHandle.Alloc(fullMask, GCHandleType.Pinned);
-                CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.I64, ovMaskShape, hMask.AddrOfPinnedObject(), out var tMask), "Mask tensor");
-
+                // 2. Chunked Pre-fill to bypass GPU memory limits (Intel 4GB buffer limit)
+                const int chunkSize = 2048;
+                float[] deepstackAllArr = null;
                 if (deepstackFeaturesTensor != 0)
                 {
-                    CheckStatus(NativeMethods.ov_tensor_data(deepstackFeaturesTensor, out nint dPtr), "dPtr");
-                    CheckStatus(NativeMethods.ov_tensor_get_size(deepstackFeaturesTensor, out nuint dSize), "dSize");
-                    float[] dArr = new float[(int)dSize];
-                    Marshal.Copy(dPtr, dArr, 0, dArr.Length);
-                    _accumulatedDeepstack.Add(dArr);
+                    NativeMethods.ov_tensor_get_size(deepstackFeaturesTensor, out nuint dSz);
+                    deepstackAllArr = new float[(int)dSz];
+                    NativeMethods.ov_tensor_data(deepstackFeaturesTensor, out nint dP);
+                    Marshal.Copy(dP, deepstackAllArr, 0, deepstackAllArr.Length);
+                    _accumulatedDeepstack.Add(deepstackAllArr);
                 }
 
-                // Global Visual Mask Input - For incremental prefill, we ONLY send THIS TURN's masks.
-                // The KV cache already has the historical context.
-                CheckStatus(NativeMethods.ov_shape_create((nuint)2, new long[] { 1, (long)currentTurnVisualMasks.Length }, out var ovVMaskShape), "vMask shape");
-                GCHandle hVMask = GCHandle.Alloc(currentTurnVisualMasks, GCHandleType.Pinned);
-                CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.BOOL, ovVMaskShape, hVMask.AddrOfPinnedObject(), out var tVMask), "vMask tensor");
 
-                // Deepstack features for THIS TURN ONLY
-                nint tDeepLocal = 0;
-                GCHandle hDeepLocal = default;
-                OvShape sDeepLocal = default;
-
-                if (deepstackFeaturesTensor != 0)
+                for (int start = 0; start < totalTurnTokens; start += chunkSize)
                 {
-                    CheckStatus(NativeMethods.ov_tensor_get_shape(deepstackFeaturesTensor, out sDeepLocal), "D shape");
-                    CheckStatus(NativeMethods.ov_tensor_data(deepstackFeaturesTensor, out nint dPtr), "D data");
-                    CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.F32, sDeepLocal, dPtr, out tDeepLocal), "D tensor");
+                    if (ct.IsCancellationRequested) throw new OperationCanceledException(ct);
+                    int count = Math.Min(chunkSize, totalTurnTokens - start);
 
-                    // Still maintain the global record for full history replay
-                    CheckStatus(NativeMethods.ov_tensor_get_size(deepstackFeaturesTensor, out nuint dSize), "dSize");
-                    float[] dArr = new float[(int)dSize];
-                    Marshal.Copy(dPtr, dArr, 0, dArr.Length);
-                    _accumulatedDeepstack.Add(dArr);
+                    // A. Input Embeddings Slice
+                    float[] chunkEmbeds = new float[count * hiddenSize];
+                    Array.Copy(inputsEmbedsArr, start * hiddenSize, chunkEmbeds, 0, count * hiddenSize);
+                    CheckStatus(NativeMethods.ov_shape_create((nuint)3, new long[] { 1, count, (long)hiddenSize }, out var ovEmbedShape), "Chunk Embed shape");
+                    GCHandle hEmbed = GCHandle.Alloc(chunkEmbeds, GCHandleType.Pinned);
+                    CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.F32, ovEmbedShape, hEmbed.AddrOfPinnedObject(), out var tEmbed), "Chunk Embed tensor");
+
+                    // B. Position IDs Slice
+                    long[] chunkPos = new long[3 * count];
+                    for (int d = 0; d < 3; d++) Array.Copy(positionIdsArr, d * totalTurnTokens + start, chunkPos, d * count, count);
+                    CheckStatus(NativeMethods.ov_shape_create((nuint)3, new long[] { 3, 1, count }, out var ovPosShape), "Chunk Pos shape");
+                    GCHandle hPos = GCHandle.Alloc(chunkPos, GCHandleType.Pinned);
+                    CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.I64, ovPosShape, hPos.AddrOfPinnedObject(), out var tPos), "Chunk Pos tensor");
+
+                    // C. Attention Mask (Incremental)
+                    int fullMaskLen = _totalPhysical + count;
+                    CheckStatus(NativeMethods.ov_shape_create((nuint)2, new long[] { 1, fullMaskLen }, out var ovMaskShape), "Chunk Mask shape");
+                    long[] fullMask = Enumerable.Repeat(1L, fullMaskLen).ToArray();
+                    GCHandle hMask = GCHandle.Alloc(fullMask, GCHandleType.Pinned);
+                    CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.I64, ovMaskShape, hMask.AddrOfPinnedObject(), out var tMask), "Chunk Mask tensor");
+
+                    // D. Visual Masks Slice
+                    bool[] chunkVMask = new bool[count];
+                    Array.Copy(currentTurnVisualMasks, start, chunkVMask, 0, count);
+                    CheckStatus(NativeMethods.ov_shape_create((nuint)2, new long[] { 1, count }, out var ovVMaskShape), "Chunk vMask shape");
+                    GCHandle hVMask = GCHandle.Alloc(chunkVMask, GCHandleType.Pinned);
+                    CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.BOOL, ovVMaskShape, hVMask.AddrOfPinnedObject(), out var tVMask), "Chunk vMask tensor");
+
+                    // E. Deepstack Slice calculation
+                    nint tDeepChunk = 0;
+                    GCHandle hDeepChunk = default;
+                    OvShape sDeepChunk = default;
+
+                    int chunkVStart = Math.Max(start, vIdBase);
+                    int chunkVEnd = Math.Min(start + count, vIdBase + (vIdBase != -1 ? numVisualTokens : 0));
+                    int chunkVCount = (vIdBase != -1 && chunkVEnd > chunkVStart) ? (chunkVEnd - chunkVStart) : 0;
+
+                    if (chunkVCount > 0 && deepstackAllArr != null)
+                    {
+                        int vOffsetInTurn = chunkVStart - vIdBase;
+                        float[] chunkD = new float[3 * chunkVCount * hiddenSize];
+                        for (int l = 0; l < 3; l++)
+                        {
+                            Array.Copy(deepstackAllArr, (l * numVisualTokens + vOffsetInTurn) * hiddenSize, chunkD, (l * chunkVCount) * hiddenSize, chunkVCount * hiddenSize);
+                        }
+                        hDeepChunk = GCHandle.Alloc(chunkD, GCHandleType.Pinned);
+                        CheckStatus(NativeMethods.ov_shape_create(3, new long[] { 3, chunkVCount, hiddenSize }, out sDeepChunk), "Chunk D shape");
+                        CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.F32, sDeepChunk, hDeepChunk.AddrOfPinnedObject(), out tDeepChunk), "Chunk D tensor");
+                    }
+                    else
+                    {
+                        CheckStatus(NativeMethods.ov_shape_create(3, new long[] { 3, 0, hiddenSize }, out sDeepChunk), "D empty shape");
+                        CheckStatus(NativeMethods.ov_tensor_create(OvElementType.F32, sDeepChunk, out tDeepChunk), "D empty tensor");
+                    }
+
+                    CheckStatus(NativeMethods.ov_shape_create((nuint)1, new long[] { 1 }, out var ovBeamShape), "Beam shape");
+                    GCHandle hBeam = GCHandle.Alloc(new int[] { 0 }, GCHandleType.Pinned);
+                    CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.I32, ovBeamShape, hBeam.AddrOfPinnedObject(), out var tBeam), "Beam tensor");
+
+                    CheckStatus(NativeMethods.ov_infer_request_set_tensor(_llmInfer, "inputs_embeds", tEmbed), "Set E");
+                    CheckStatus(NativeMethods.ov_infer_request_set_tensor(_llmInfer, "position_ids", tPos), "Set P");
+                    CheckStatus(_pipeline.HandleAttnMask(_llmInfer, tMask), "Set M");
+                    CheckStatus(NativeMethods.ov_infer_request_set_tensor(_llmInfer, "deepstack_visual_embeds", tDeepChunk), "Set D");
+                    CheckStatus(NativeMethods.ov_infer_request_set_tensor(_llmInfer, "visual_pos_masks", tVMask), "Set V");
+                    CheckStatus(NativeMethods.ov_infer_request_set_tensor(_llmInfer, "beam_idx", tBeam), "Set B");
+
+                    var chunkSw = System.Diagnostics.Stopwatch.StartNew();
+                    CheckStatus(NativeMethods.ov_infer_request_infer(_llmInfer), "Chunk prefill infer");
+                    chunkSw.Stop();
+                    prefillMs += chunkSw.Elapsed.TotalMilliseconds;
+
+                    _totalPhysical += count;
+
+                    // Cleanup chunk tensors
+                    NativeMethods.ov_tensor_free(tEmbed); NativeMethods.ov_shape_free(ref ovEmbedShape); hEmbed.Free();
+                    NativeMethods.ov_tensor_free(tPos); NativeMethods.ov_shape_free(ref ovPosShape); hPos.Free();
+                    NativeMethods.ov_tensor_free(tMask); NativeMethods.ov_shape_free(ref ovMaskShape); hMask.Free();
+                    NativeMethods.ov_tensor_free(tDeepChunk); NativeMethods.ov_shape_free(ref sDeepChunk); if (hDeepChunk.IsAllocated) hDeepChunk.Free();
+                    NativeMethods.ov_tensor_free(tVMask); NativeMethods.ov_shape_free(ref ovVMaskShape); hVMask.Free();
+                    NativeMethods.ov_tensor_free(tBeam); NativeMethods.ov_shape_free(ref ovBeamShape); hBeam.Free();
                 }
-                else
-                {
-                    CheckStatus(NativeMethods.ov_shape_create(3, new long[] { 3, 0, hiddenSize }, out sDeepLocal), "D empty shape");
-                    CheckStatus(NativeMethods.ov_tensor_create(OvElementType.F32, sDeepLocal, out tDeepLocal), "D empty tensor");
-                }
 
-                CheckStatus(NativeMethods.ov_shape_create((nuint)1, new long[] { 1 }, out var ovBeamShape), "Beam shape");
-                GCHandle hBeam = GCHandle.Alloc(new int[] { 0 }, GCHandleType.Pinned);
-                CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.I32, ovBeamShape, hBeam.AddrOfPinnedObject(), out var tBeam), "Beam tensor");
-
-                CheckStatus(NativeMethods.ov_infer_request_set_tensor(_llmInfer, "inputs_embeds", tEmbed), "Set E");
-                CheckStatus(NativeMethods.ov_infer_request_set_tensor(_llmInfer, "position_ids", tPos), "Set P");
-                CheckStatus(_pipeline.HandleAttnMask(_llmInfer, tMask), "Set M");
-                CheckStatus(NativeMethods.ov_infer_request_set_tensor(_llmInfer, "deepstack_visual_embeds", tDeepLocal), "Set D");
-                CheckStatus(NativeMethods.ov_infer_request_set_tensor(_llmInfer, "visual_pos_masks", tVMask), "Set V");
-                CheckStatus(NativeMethods.ov_infer_request_set_tensor(_llmInfer, "beam_idx", tBeam), "Set B");
-
-                var psw = System.Diagnostics.Stopwatch.StartNew();
-                CheckStatus(NativeMethods.ov_infer_request_infer(_llmInfer), "Prefill infer");
-                psw.Stop();
-                prefillMs = psw.Elapsed.TotalMilliseconds;
-
-                _totalPhysical += totalTurnTokens;
+                _sessionVisualMasks.AddRange(currentTurnVisualMasks);
                 _totalTemporal = currentT;
 
-                // Cleanup
-                NativeMethods.ov_tensor_free(tEmbed); NativeMethods.ov_shape_free(ref ovEmbedShape); hEmbed.Free();
-                NativeMethods.ov_tensor_free(tPos); NativeMethods.ov_shape_free(ref ovPosShape); hPos.Free();
-                NativeMethods.ov_tensor_free(tMask); NativeMethods.ov_shape_free(ref ovMaskShape); hMask.Free();
-                NativeMethods.ov_tensor_free(tDeepLocal); NativeMethods.ov_shape_free(ref sDeepLocal);
-                NativeMethods.ov_tensor_free(tVMask); NativeMethods.ov_shape_free(ref ovVMaskShape); hVMask.Free();
-                NativeMethods.ov_tensor_free(tBeam); NativeMethods.ov_shape_free(ref ovBeamShape); hBeam.Free();
-
-                var generatedIds = DecodeResponse(config, silent, prefillMs, visualMs, overallSw, ct);
+                var generatedIds = DecodeResponse(config, silent, prefillMs, visualMs, overallSw, ct, onToken, onStats);
 
                 if (visualEmbedsTensor != 0) NativeMethods.ov_tensor_free(visualEmbedsTensor);
                 if (deepstackFeaturesTensor != 0) NativeMethods.ov_tensor_free(deepstackFeaturesTensor);
@@ -403,6 +519,8 @@ public class Qwen3VLPipeline : IDisposable
                 {
                     Prompt = prompt,
                     ImagePath = imagePath,
+                    VideoPath = videoPath,
+                    MaxVideoFrames = maxVideoFrames,
                     GeneratedIds = generatedIds
                 });
                 return generatedIds;
@@ -413,12 +531,12 @@ public class Qwen3VLPipeline : IDisposable
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[Chat Error] {ex.Message}");
+                Console.WriteLine($"[Chat Error] {ex.Message}\n{ex.StackTrace}");
                 return new List<int>();
             }
         }
 
-        private List<int> DecodeResponse(GenerationConfig config, bool silent, double prefillMs, double visualMs, System.Diagnostics.Stopwatch overallSw, CancellationToken ct)
+        private List<int> DecodeResponse(GenerationConfig config, bool silent, double prefillMs, double visualMs, Stopwatch overallSw, CancellationToken ct, Action<string>? onToken = null, Action<GenerationStats>? onStats = null)
         {
             double ttft = 0;
             int hiddenSize = _pipeline._hiddenSize;
@@ -529,14 +647,12 @@ public class Qwen3VLPipeline : IDisposable
                 // Increment counts immediately to stay in sync with KV Cache
                 _totalPhysical++;
                 _totalTemporal++;
+                _sessionVisualMasks.Add(false); // Text token mask
 
                 // Update masks shape to reflect current sequence length
-                CheckStatus(NativeMethods.ov_shape_create(2, new long[] { 1, physPos + 1 }, out var sMCur), "sMCur");
+                CheckStatus(NativeMethods.ov_shape_create(2, new long[] { 1, _totalPhysical }, out var sMCur), "sMCur");
                 CheckStatus(NativeMethods.ov_tensor_set_shape(tM, sMCur), "Update M shape");
-                // CheckStatus(NativeMethods.ov_shape_create(2, new long[] { 1, physPos + 1 }, out var sVCur), "sVCur"); // No longer needed as tV is fixed
-                // CheckStatus(NativeMethods.ov_tensor_set_shape(tV, sVCur), "Update V shape"); // No longer needed as tV is fixed
                 NativeMethods.ov_shape_free(ref sMCur);
-                // NativeMethods.ov_shape_free(ref sVCur); // No longer needed as tV is fixed
 
                 var swInfer = System.Diagnostics.Stopwatch.StartNew();
                 if (useInputIds)
@@ -574,7 +690,7 @@ public class Qwen3VLPipeline : IDisposable
                 swDeser.Stop();
                 accDeserMs += swDeser.Elapsed.TotalMilliseconds;
 
-                if (!silent && fullDecoded.Length > printedLength)
+                if (fullDecoded.Length > printedLength)
                 {
                     string newText = fullDecoded.Substring(printedLength);
                     if (config.StopSequences != null && config.StopSequences.Count > 0)
@@ -587,7 +703,9 @@ public class Qwen3VLPipeline : IDisposable
                             if (newText.Contains(seq))
                             {
                                 int stopIdx = newText.IndexOf(seq);
-                                if (!silent) Console.Write(newText.Substring(0, stopIdx));
+                                var stopText = newText.Substring(0, stopIdx);
+                                if (!silent) Console.Write(stopText);
+                                onToken?.Invoke(stopText);
                                 matchesStop = true;
                                 matchedSeq = seq;
                                 matchedStopIdx = stopIdx;
@@ -608,13 +726,16 @@ public class Qwen3VLPipeline : IDisposable
                         string safePart = fullDecoded.Substring(0, fullDecoded.Length - 1);
                         if (safePart.Length > printedLength)
                         {
-                            if (!silent) Console.Write(safePart.Substring(printedLength));
+                            var partialText = safePart.Substring(printedLength);
+                            if (!silent) Console.Write(partialText);
+                            onToken?.Invoke(partialText);
                             printedLength = safePart.Length;
                         }
                     }
                     else
                     {
                         if (!silent) Console.Write(newText);
+                        onToken?.Invoke(newText);
                         printedLength = fullDecoded.Length;
                     }
                 }
@@ -659,11 +780,28 @@ public class Qwen3VLPipeline : IDisposable
             uint[] finalTokens = new uint[generatedIds.Count];
             Array.Copy(tokenBuffer, finalTokens, generatedIds.Count);
             string finalDecoded = _pipeline._tokenizer.Decode(finalTokens, skipSpecialTokens: true);
-            if (!silent && finalDecoded.Length > printedLength) Console.Write(finalDecoded.Substring(printedLength));
+            if (finalDecoded.Length > printedLength)
+            {
+                var remaining = finalDecoded.Substring(printedLength);
+                if (!silent) Console.Write(remaining);
+                onToken?.Invoke(remaining);
+            }
 
+            // Update stats
             sw.Stop();
-            double tps = generatedCount / sw.Elapsed.TotalSeconds;
-            if (!silent) Console.WriteLine($"\n[Stats] Generated: {generatedCount} tokens | Speed: {tps:F2} t/s");
+            onStats?.Invoke(new GenerationStats
+            {
+                PrefillMs = prefillMs,
+                DecodeMs = sw.Elapsed.TotalMilliseconds,
+                TokenCount = generatedCount
+            });
+
+            if (!silent)
+            {
+                double tps = generatedCount / sw.Elapsed.TotalSeconds;
+                Console.WriteLine($"\n[Stats] Generated: {generatedCount} tokens | Speed: {tps:F2} t/s");
+            }
+
             return generatedIds;
         }
 
@@ -691,7 +829,8 @@ public class Qwen3VLPipeline : IDisposable
             var state = new SessionState
             {
                 SystemPrompt = _systemPrompt,
-                History = _history
+                History = _history,
+                Title = this.Title
             };
 
             string json = System.Text.Json.JsonSerializer.Serialize(state, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
@@ -751,35 +890,45 @@ public class Qwen3VLPipeline : IDisposable
 
         public void Load(string path)
         {
-            if (_totalPhysical > 0) throw new InvalidOperationException("Cannot load into a non-empty session.");
             if (!Directory.Exists(path)) throw new DirectoryNotFoundException(path);
-
             string jsonPath = Path.Combine(path, "session.json");
             if (!File.Exists(jsonPath)) throw new FileNotFoundException("session.json not found", jsonPath);
 
             string json = File.ReadAllText(jsonPath);
             var state = System.Text.Json.JsonSerializer.Deserialize<SessionState>(json);
-
             if (state == null) throw new Exception("Failed to deserialize session state.");
 
+            Load(state.SystemPrompt, state.Title, state.History);
+        }
+
+        public void Load(string? systemPrompt, string? title, List<TurnData> history)
+        {
+            if (_totalPhysical > 0) throw new InvalidOperationException("Cannot load into a non-empty session.");
+
             // 1. Restore System Prompt
-            if (!string.IsNullOrEmpty(state.SystemPrompt))
+            if (!string.IsNullOrEmpty(systemPrompt))
             {
-                InitSystemPrompt(state.SystemPrompt);
+                InitSystemPrompt(systemPrompt);
             }
+            this.Title = title;
 
             // 2. Replay History
-            Console.WriteLine($"[Info] Replaying {state.History.Count} turns...");
-            foreach (var turn in state.History)
+            Console.WriteLine($"[Info] Replaying {history.Count} turns...");
+            foreach (var turn in history)
             {
                 Console.WriteLine($"  - Replaying: {turn.Prompt.Substring(0, Math.Min(20, turn.Prompt.Length))}...");
-                ReplayTurn(turn, CancellationToken.None); // Pass CancellationToken.None for replay
+                ReplayTurn(turn, CancellationToken.None);
             }
+
+            // 3. Restore history list
+            _history = history;
+
             Console.WriteLine("[Info] Replay complete.");
         }
 
         private class SessionState
         {
+            public string? Title { get; set; }
             public string? SystemPrompt { get; set; }
             public List<TurnData> History { get; set; } = new List<TurnData>();
         }
@@ -791,11 +940,20 @@ public class Qwen3VLPipeline : IDisposable
             nint visualEmbedsTensor = 0;
             nint deepstackFeaturesTensor = 0;
             int numVisualTokens = 0;
-            int gridH = 0, gridW = 0;
+            int gridT = 0, gridH = 0, gridW = 0;
+            int vIdBase = -1;
 
-            if (turn.ImagePath != null && File.Exists(turn.ImagePath))
+            if (turn.VideoPath != null && File.Exists(turn.VideoPath))
             {
-                (visualEmbedsTensor, deepstackFeaturesTensor, _, gridH, gridW) = _pipeline.ProcessImage(turn.ImagePath);
+                (visualEmbedsTensor, deepstackFeaturesTensor, gridT, gridH, gridW) = _pipeline.ProcessVideo(turn.VideoPath, turn.MaxVideoFrames, silent: true);
+                CheckStatus(NativeMethods.ov_tensor_get_shape(visualEmbedsTensor, out var vShape), "Get vShape");
+                long[] dims = _pipeline.GetShapeDims(vShape);
+                NativeMethods.ov_shape_free(ref vShape);
+                numVisualTokens = (int)(dims.Length == 3 ? dims[1] : dims[0]);
+            }
+            else if (turn.ImagePath != null && File.Exists(turn.ImagePath))
+            {
+                (visualEmbedsTensor, deepstackFeaturesTensor, gridT, gridH, gridW) = _pipeline.ProcessImage(turn.ImagePath, silent: true);
                 CheckStatus(NativeMethods.ov_tensor_get_shape(visualEmbedsTensor, out var vShape), "Get vShape");
                 long[] dims = _pipeline.GetShapeDims(vShape);
                 NativeMethods.ov_shape_free(ref vShape);
@@ -810,7 +968,8 @@ public class Qwen3VLPipeline : IDisposable
             {
                 visualStartIdx = turnIds.Count;
                 turnIds.AddRange(_pipeline._tokenizer.Encode("<|vision_start|>", addSpecialTokens: false).First().Ids.Select(x => (int)x));
-                for (int i = 0; i < numVisualTokens; i++) turnIds.Add(0);
+                int padToken = turn.VideoPath != null ? 151656 : 151655;
+                for (int i = 0; i < numVisualTokens; i++) turnIds.Add(padToken);
                 turnIds.AddRange(_pipeline._tokenizer.Encode("<|vision_end|>", addSpecialTokens: false).First().Ids.Select(x => (int)x));
             }
 
@@ -825,20 +984,28 @@ public class Qwen3VLPipeline : IDisposable
             bool[] visualPosMasksArr = new bool[totalTurnTokens];
 
             // Image Injection
-            if (numVisualTokens > 0)
+            vIdBase = (numVisualTokens > 0) ? (visualStartIdx + _pipeline._tokenizer.Encode("<|vision_start|>", addSpecialTokens: false).First().Ids.Count) : -1;
+            if (visualEmbedsTensor != 0 && vIdBase != -1)
             {
-                int vIdStart = visualStartIdx + _pipeline._tokenizer.Encode("<|vision_start|>", addSpecialTokens: false).First().Ids.Count;
                 CheckStatus(NativeMethods.ov_tensor_data(visualEmbedsTensor, out nint vPtr), "vPtr");
                 int copyLen = numVisualTokens * hiddenSize;
-                Marshal.Copy(vPtr, inputsEmbedsArr, vIdStart * hiddenSize, copyLen);
+                if (vIdBase >= 0 && (vIdBase + numVisualTokens) * hiddenSize <= inputsEmbedsArr.Length)
+                {
+                    Marshal.Copy(vPtr, inputsEmbedsArr, vIdBase * hiddenSize, copyLen);
+                }
 
+                int llmGridH = gridH;
+                int llmGridW = gridW;
                 for (int i = 0; i < numVisualTokens; i++)
                 {
-                    int idx = vIdStart + i;
-                    visualPosMasksArr[idx] = true;
-                    positionIdsArr[0 * totalTurnTokens + idx] = _totalTemporal;
-                    positionIdsArr[1 * totalTurnTokens + idx] = (i / gridW);
-                    positionIdsArr[2 * totalTurnTokens + idx] = i % gridW;
+                    int idx = vIdBase + i;
+                    if (idx >= 0 && idx < totalTurnTokens)
+                    {
+                        visualPosMasksArr[idx] = true;
+                        positionIdsArr[0 * totalTurnTokens + idx] = _totalTemporal + (i / (llmGridH * llmGridW));
+                        positionIdsArr[1 * totalTurnTokens + idx] = _totalTemporal + ((i / llmGridW) % llmGridH);
+                        positionIdsArr[2 * totalTurnTokens + idx] = _totalTemporal + (i % llmGridW);
+                    }
                 }
             }
 
@@ -846,7 +1013,6 @@ public class Qwen3VLPipeline : IDisposable
             int currentT = _totalTemporal;
             bool inVision = false;
             int vTokensHandled = 0;
-            int vIdBase = (numVisualTokens > 0) ? (visualStartIdx + _pipeline._tokenizer.Encode("<|vision_start|>", addSpecialTokens: false).First().Ids.Count) : -1;
 
             for (int i = 0; i < totalTurnTokens; i++)
             {
@@ -861,66 +1027,112 @@ public class Qwen3VLPipeline : IDisposable
                 if (inVision)
                 {
                     vTokensHandled++;
-                    if (vTokensHandled >= numVisualTokens) inVision = false;
+                    if (vTokensHandled >= numVisualTokens)
+                    {
+                        inVision = false;
+                        currentT += (gridT > 0 ? gridT : 1);
+                    }
                 }
                 else currentT++;
             }
 
-            // Tensors & Infer
-            CheckStatus(NativeMethods.ov_shape_create((nuint)3, new long[] { 1, totalTurnTokens, hiddenSize }, out var ovEmbedShape), "Embed shape");
-            GCHandle hEmbed = GCHandle.Alloc(inputsEmbedsArr, GCHandleType.Pinned);
-            CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.F32, ovEmbedShape, hEmbed.AddrOfPinnedObject(), out var tEmbed), "Embed tensor");
-
-            CheckStatus(NativeMethods.ov_shape_create((nuint)3, new long[] { 3, 1, totalTurnTokens }, out var ovPosShape), "Pos shape");
-            GCHandle hPos = GCHandle.Alloc(positionIdsArr, GCHandleType.Pinned);
-            CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.I64, ovPosShape, hPos.AddrOfPinnedObject(), out var tPos), "Pos tensor");
-
-            int fullMaskLen = _totalPhysical + totalTurnTokens;
-            CheckStatus(NativeMethods.ov_shape_create((nuint)2, new long[] { 1, fullMaskLen }, out var ovMaskShape), "Mask shape");
-            long[] fullMask = Enumerable.Repeat(1L, fullMaskLen).ToArray();
-            GCHandle hMask = GCHandle.Alloc(fullMask, GCHandleType.Pinned);
-            CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.I64, ovMaskShape, hMask.AddrOfPinnedObject(), out var tMask), "Mask tensor");
-
-            // Accumulate new image features if any for the turn being replayed
+            // 2. Chunked Pre-fill to bypass GPU memory limits (Intel 4GB buffer limit)
+            const int chunkSize = 2048;
+            float[] deepstackAllArr = null;
             if (deepstackFeaturesTensor != 0)
             {
-                CheckStatus(NativeMethods.ov_tensor_data(deepstackFeaturesTensor, out nint dPtr), "dPtr");
-                CheckStatus(NativeMethods.ov_tensor_get_size(deepstackFeaturesTensor, out nuint dSize), "dSize");
-                float[] dArr = new float[(int)dSize];
-                Marshal.Copy(dPtr, dArr, 0, dArr.Length);
-                _accumulatedDeepstack.Add(dArr);
+                NativeMethods.ov_tensor_get_size(deepstackFeaturesTensor, out nuint dSz);
+                deepstackAllArr = new float[(int)dSz];
+                NativeMethods.ov_tensor_data(deepstackFeaturesTensor, out nint dP);
+                Marshal.Copy(dP, deepstackAllArr, 0, deepstackAllArr.Length);
+                _accumulatedDeepstack.Add(deepstackAllArr);
+            }
+
+            for (int start = 0; start < totalTurnTokens; start += chunkSize)
+            {
+                int count = Math.Min(chunkSize, totalTurnTokens - start);
+
+                // A. Input Embeddings Slice
+                float[] chunkEmbeds = new float[count * hiddenSize];
+                Array.Copy(inputsEmbedsArr, start * hiddenSize, chunkEmbeds, 0, count * hiddenSize);
+                CheckStatus(NativeMethods.ov_shape_create((nuint)3, new long[] { 1, count, (long)hiddenSize }, out var ovEmbedShape), "Chunk Embed shape");
+                GCHandle hEmbed = GCHandle.Alloc(chunkEmbeds, GCHandleType.Pinned);
+                CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.F32, ovEmbedShape, hEmbed.AddrOfPinnedObject(), out var tEmbed), "Chunk Embed tensor");
+
+                // B. Position IDs Slice
+                long[] chunkPos = new long[3 * count];
+                for (int d = 0; d < 3; d++) Array.Copy(positionIdsArr, d * totalTurnTokens + start, chunkPos, d * count, count);
+                CheckStatus(NativeMethods.ov_shape_create((nuint)3, new long[] { 3, 1, count }, out var ovPosShape), "Chunk Pos shape");
+                GCHandle hPos = GCHandle.Alloc(chunkPos, GCHandleType.Pinned);
+                CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.I64, ovPosShape, hPos.AddrOfPinnedObject(), out var tPos), "Chunk Pos tensor");
+
+                // C. Attention Mask (Incremental)
+                int fullMaskLen = _totalPhysical + count;
+                CheckStatus(NativeMethods.ov_shape_create((nuint)2, new long[] { 1, fullMaskLen }, out var ovMaskShape), "Chunk Mask shape");
+                long[] fullMask = Enumerable.Repeat(1L, fullMaskLen).ToArray();
+                GCHandle hMask = GCHandle.Alloc(fullMask, GCHandleType.Pinned);
+                CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.I64, ovMaskShape, hMask.AddrOfPinnedObject(), out var tMask), "Chunk Mask tensor");
+
+                // D. Visual Masks Slice
+                bool[] chunkVMask = new bool[count];
+                Array.Copy(visualPosMasksArr, start, chunkVMask, 0, count);
+                CheckStatus(NativeMethods.ov_shape_create((nuint)2, new long[] { 1, count }, out var ovVMaskShape), "Chunk vMask shape");
+                GCHandle hVMask = GCHandle.Alloc(chunkVMask, GCHandleType.Pinned);
+                CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.BOOL, ovVMaskShape, hVMask.AddrOfPinnedObject(), out var tVMask), "Chunk vMask tensor");
+
+                // E. Deepstack Slice calculation
+                nint tDeepChunk = 0;
+                GCHandle hDeepChunk = default;
+                OvShape sDeepChunk = default;
+
+                int chunkVStart = Math.Max(start, vIdBase);
+                int chunkVEnd = Math.Min(start + count, vIdBase + (vIdBase != -1 ? numVisualTokens : 0));
+                int chunkVCount = (vIdBase != -1 && chunkVEnd > chunkVStart) ? (chunkVEnd - chunkVStart) : 0;
+
+                if (chunkVCount > 0 && deepstackAllArr != null)
+                {
+                    int vOffsetInTurn = chunkVStart - vIdBase;
+                    float[] chunkD = new float[3 * chunkVCount * hiddenSize];
+                    for (int l = 0; l < 3; l++)
+                    {
+                        Array.Copy(deepstackAllArr, (l * numVisualTokens + vOffsetInTurn) * hiddenSize, chunkD, (l * chunkVCount) * hiddenSize, chunkVCount * hiddenSize);
+                    }
+                    hDeepChunk = GCHandle.Alloc(chunkD, GCHandleType.Pinned);
+                    CheckStatus(NativeMethods.ov_shape_create(3, new long[] { 3, chunkVCount, hiddenSize }, out sDeepChunk), "Chunk D shape");
+                    CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.F32, sDeepChunk, hDeepChunk.AddrOfPinnedObject(), out tDeepChunk), "Chunk D tensor");
+                }
+                else
+                {
+                    CheckStatus(NativeMethods.ov_shape_create(3, new long[] { 3, 0, hiddenSize }, out sDeepChunk), "D empty shape");
+                    CheckStatus(NativeMethods.ov_tensor_create(OvElementType.F32, sDeepChunk, out tDeepChunk), "D empty tensor");
+                }
+
+                CheckStatus(NativeMethods.ov_shape_create((nuint)1, new long[] { 1 }, out var ovBeamShape), "Beam shape");
+                GCHandle hBeam = GCHandle.Alloc(new int[] { 0 }, GCHandleType.Pinned);
+                CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.I32, ovBeamShape, hBeam.AddrOfPinnedObject(), out var tBeam), "Beam tensor");
+
+                CheckStatus(NativeMethods.ov_infer_request_set_tensor(_llmInfer, "inputs_embeds", tEmbed), "Set E");
+                CheckStatus(NativeMethods.ov_infer_request_set_tensor(_llmInfer, "position_ids", tPos), "Set P");
+                CheckStatus(_pipeline.HandleAttnMask(_llmInfer, tMask), "Set M");
+                CheckStatus(NativeMethods.ov_infer_request_set_tensor(_llmInfer, "deepstack_visual_embeds", tDeepChunk), "Set D");
+                CheckStatus(NativeMethods.ov_infer_request_set_tensor(_llmInfer, "visual_pos_masks", tVMask), "Set V");
+                CheckStatus(NativeMethods.ov_infer_request_set_tensor(_llmInfer, "beam_idx", tBeam), "Set B");
+
+                CheckStatus(NativeMethods.ov_infer_request_infer(_llmInfer), "Chunk replay infer");
+
+                _totalPhysical += count;
+
+                // Cleanup chunk tensors
+                NativeMethods.ov_tensor_free(tEmbed); NativeMethods.ov_shape_free(ref ovEmbedShape); hEmbed.Free();
+                NativeMethods.ov_tensor_free(tPos); NativeMethods.ov_shape_free(ref ovPosShape); hPos.Free();
+                NativeMethods.ov_tensor_free(tMask); NativeMethods.ov_shape_free(ref ovMaskShape); hMask.Free();
+                NativeMethods.ov_tensor_free(tDeepChunk); NativeMethods.ov_shape_free(ref sDeepChunk); if (hDeepChunk.IsAllocated) hDeepChunk.Free();
+                NativeMethods.ov_tensor_free(tVMask); NativeMethods.ov_shape_free(ref ovVMaskShape); hVMask.Free();
+                NativeMethods.ov_tensor_free(tBeam); NativeMethods.ov_shape_free(ref ovBeamShape); hBeam.Free();
             }
 
             _sessionVisualMasks.AddRange(visualPosMasksArr);
-            bool[] globalMaskArr = _sessionVisualMasks.ToArray();
-            CheckStatus(NativeMethods.ov_shape_create((nuint)2, new long[] { 1, (long)globalMaskArr.Length }, out var ovVMaskShape), "vMask shape");
-            GCHandle hVMask = GCHandle.Alloc(globalMaskArr, GCHandleType.Pinned);
-            CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.BOOL, ovVMaskShape, hVMask.AddrOfPinnedObject(), out var tVMask), "vMask tensor");
-
-            CheckStatus(NativeMethods.ov_shape_create((nuint)1, new long[] { 1 }, out var ovBeamShape), "Beam shape");
-            GCHandle hBeam = GCHandle.Alloc(new int[] { 0 }, GCHandleType.Pinned);
-            CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.I32, ovBeamShape, hBeam.AddrOfPinnedObject(), out var tBeam), "Beam tensor");
-
-            CheckStatus(NativeMethods.ov_infer_request_set_tensor(_llmInfer, "inputs_embeds", tEmbed), "Set E");
-            CheckStatus(NativeMethods.ov_infer_request_set_tensor(_llmInfer, "position_ids", tPos), "Set P");
-            CheckStatus(_pipeline.HandleAttnMask(_llmInfer, tMask), "Set M");
-
-            nint tDeepCombined = CreateCombinedDeepstack(out GCHandle hDeepComb, out var sDeepComb);
-            CheckStatus(NativeMethods.ov_infer_request_set_tensor(_llmInfer, "deepstack_visual_embeds", tDeepCombined), "Set D");
-            CheckStatus(NativeMethods.ov_infer_request_set_tensor(_llmInfer, "visual_pos_masks", tVMask), "Set V");
-            CheckStatus(NativeMethods.ov_infer_request_set_tensor(_llmInfer, "beam_idx", tBeam), "Set B");
-
-            CheckStatus(NativeMethods.ov_infer_request_infer(_llmInfer), "Replay infer");
-
-            _totalPhysical += totalTurnTokens;
             _totalTemporal = currentT;
-
-            NativeMethods.ov_tensor_free(tEmbed); NativeMethods.ov_shape_free(ref ovEmbedShape); hEmbed.Free();
-            NativeMethods.ov_tensor_free(tPos); NativeMethods.ov_shape_free(ref ovPosShape); hPos.Free();
-            NativeMethods.ov_tensor_free(tMask); NativeMethods.ov_shape_free(ref ovMaskShape); hMask.Free();
-            NativeMethods.ov_tensor_free(tDeepCombined); NativeMethods.ov_shape_free(ref sDeepComb); if (hDeepComb.IsAllocated) hDeepComb.Free();
-            NativeMethods.ov_tensor_free(tVMask); NativeMethods.ov_shape_free(ref ovVMaskShape); hVMask.Free();
-            NativeMethods.ov_tensor_free(tBeam); NativeMethods.ov_shape_free(ref ovBeamShape); hBeam.Free();
 
             if (visualEmbedsTensor != 0) NativeMethods.ov_tensor_free(visualEmbedsTensor);
             if (deepstackFeaturesTensor != 0) NativeMethods.ov_tensor_free(deepstackFeaturesTensor);
@@ -960,6 +1172,8 @@ public class Qwen3VLPipeline : IDisposable
             CheckStatus(NativeMethods.ov_tensor_create_from_host_ptr(OvElementType.F32, shape, handle.AddrOfPinnedObject(), out nint tensor), "Create combined D tensor");
             return tensor;
         }
+
+        public List<TurnData> GetHistory() => _history;
 
         public void Dispose()
         {
@@ -1129,82 +1343,48 @@ public class Qwen3VLPipeline : IDisposable
 
         // Optimization: Single-pass TopK selection using a small array
         // Increased for better accuracy in non-greedy sampling
-        const int MAX_TOP_K = 1024;
-        int k = MAX_TOP_K;
-
+        // Optimization: Single-pass fast Top-K selection on the main thread.
+        // Parallel.For on 150K items has massive overhead (15-20ms) which dominates the token time.
+        // A simple scalar loop here takes < 0.5ms.
+        int k = (config.TopK > 0 && config.TopK < 256) ? config.TopK * 2 : 128;
         if (_sortBuffer == null || _sortBuffer.Length < k) _sortBuffer = new LogitCandidate[k];
-
-        // Parallel sampling to utilize Xeon E5 cores
-        int numChunks = Environment.ProcessorCount;
-        int chunkSize = (vocabLen + numChunks - 1) / numChunks;
-        var chunkTops = new LogitCandidate[numChunks][];
-        int[] chunkCounts = new int[numChunks];
-
-        Parallel.For(0, numChunks, c =>
-        {
-            int start = c * chunkSize;
-            int end = Math.Min(start + chunkSize, vocabLen);
-            if (start >= end) return;
-
-            var localBuffer = new LogitCandidate[k];
-            int localCount = 0;
-            float localMin = -float.MaxValue;
-            int localMinIdx = -1;
-
-            for (int i = start; i < end; i++)
-            {
-                float val = logitsPtr[i];
-                if (applyPenalty && historySet != null && historySet.Contains(i) && i < 151643)
-                {
-                    // Repetition Penalty
-                    if (val < 0) val *= repPenalty; else val /= repPenalty;
-                    // Presence Penalty
-                    val -= config.PresencePenalty;
-                    // Frequency Penalty
-                    val -= freqPenalty;
-                }
-                float score = val * tempInv;
-
-                if (localCount < k)
-                {
-                    localBuffer[localCount].Id = i;
-                    localBuffer[localCount].Logit = score;
-                    if (score < localMin || localMinIdx == -1) { localMin = score; localMinIdx = localCount; }
-                    localCount++;
-                }
-                else if (score > localMin)
-                {
-                    localBuffer[localMinIdx].Id = i;
-                    localBuffer[localMinIdx].Logit = score;
-                    localMin = localBuffer[0].Logit; localMinIdx = 0;
-                    for (int j = 1; j < k; j++) { if (localBuffer[j].Logit < localMin) { localMin = localBuffer[j].Logit; localMinIdx = j; } }
-                }
-            }
-            chunkTops[c] = localBuffer;
-            chunkCounts[c] = localCount;
-        });
 
         int candidatesCount = 0;
         float minScoreInTopK = -float.MaxValue;
         int minScoreIdx = -1;
 
-        for (int c = 0; c < numChunks; c++)
+        for (int i = 0; i < vocabLen; i++)
         {
-            if (chunkTops[c] == null) continue;
-            for (int i = 0; i < chunkCounts[c]; i++)
+            float val = logitsPtr[i];
+            if (applyPenalty && historySet!.Contains(i) && i < 151643)
             {
-                var cand = chunkTops[c][i];
-                if (candidatesCount < k)
+                if (val < 0) val *= repPenalty; else val /= repPenalty;
+                val -= config.PresencePenalty;
+                val -= freqPenalty;
+            }
+            float score = val * tempInv;
+
+            if (candidatesCount < k)
+            {
+                _sortBuffer[candidatesCount].Id = i;
+                _sortBuffer[candidatesCount].Logit = score;
+                if (score < minScoreInTopK || minScoreIdx == -1) { minScoreInTopK = score; minScoreIdx = candidatesCount; }
+                candidatesCount++;
+            }
+            else if (score > minScoreInTopK)
+            {
+                _sortBuffer[minScoreIdx].Id = i;
+                _sortBuffer[minScoreIdx].Logit = score;
+
+                minScoreInTopK = _sortBuffer[0].Logit;
+                minScoreIdx = 0;
+                for (int j = 1; j < k; j++)
                 {
-                    _sortBuffer[candidatesCount] = cand;
-                    if (cand.Logit < minScoreInTopK || minScoreIdx == -1) { minScoreInTopK = cand.Logit; minScoreIdx = candidatesCount; }
-                    candidatesCount++;
-                }
-                else if (cand.Logit > minScoreInTopK)
-                {
-                    _sortBuffer[minScoreIdx] = cand;
-                    minScoreInTopK = _sortBuffer[0].Logit; minScoreIdx = 0;
-                    for (int j = 1; j < k; j++) { if (_sortBuffer[j].Logit < minScoreInTopK) { minScoreInTopK = _sortBuffer[j].Logit; minScoreIdx = j; } }
+                    if (_sortBuffer[j].Logit < minScoreInTopK)
+                    {
+                        minScoreInTopK = _sortBuffer[j].Logit;
+                        minScoreIdx = j;
+                    }
                 }
             }
         }
@@ -1341,13 +1521,38 @@ public class Qwen3VLPipeline : IDisposable
         }
     }
 
-    private (nint embeds, nint deepstack, int t, int h, int w) ProcessImage(string path)
+    /// <summary>
+    /// Matches official Qwen3VL smart_resize: preserves aspect ratio, rounds to factor multiples.
+    /// factor = patch_size(16) * merge_size(2) = 32
+    /// </summary>
+    private static (int h, int w) SmartResize(int height, int width,
+        int factor = 32, int minPixels = 256 * 256, int maxPixels = 1280 * 28 * 28)
+    {
+        int hBar = (int)Math.Round((double)height / factor) * factor;
+        int wBar = (int)Math.Round((double)width / factor) * factor;
+        if (hBar < factor) hBar = factor;
+        if (wBar < factor) wBar = factor;
+        if ((long)hBar * wBar > maxPixels)
+        {
+            double beta = Math.Sqrt((double)height * width / maxPixels);
+            hBar = Math.Max(factor, (int)Math.Floor(height / beta / factor) * factor);
+            wBar = Math.Max(factor, (int)Math.Floor(width / beta / factor) * factor);
+        }
+        else if ((long)hBar * wBar < minPixels)
+        {
+            double beta = Math.Sqrt((double)minPixels / (height * width));
+            hBar = (int)Math.Ceiling(height * beta / factor) * factor;
+            wBar = (int)Math.Ceiling(width * beta / factor) * factor;
+        }
+        return (hBar, wBar);
+    }
+
+    private (nint embeds, nint deepstack, int t, int h, int w) ProcessImage(string path, bool silent = false)
     {
         using var rawImage = Image.Load<Rgb24>(path);
 
-        // 1. Target Size (288x256 -> 18x16 patches)
-        int targetW = 256;
-        int targetH = 288;
+        // 1. Dynamic Smart Resize (preserves aspect ratio, multiples of factor=32)
+        var (targetH, targetW) = SmartResize(rawImage.Height, rawImage.Width);
         rawImage.Mutate(x => x.Resize(targetW, targetH));
 
         int gridT = 1;
@@ -1369,6 +1574,9 @@ public class Qwen3VLPipeline : IDisposable
         float[] pixelValues = new float[numPatches * 1536];
         long[] posIndices = new long[4 * numPatches];
         float[] posWeights = new float[4 * numPatches];
+
+        float[] mean = { 0.48145466f, 0.4578275f, 0.40821073f };
+        float[] std = { 0.26862954f, 0.26130258f, 0.27577711f };
 
         float[] hIdxsGrid = new float[gridH];
         float[] wIdxsGrid = new float[gridW];
@@ -1400,10 +1608,11 @@ public class Qwen3VLPipeline : IDisposable
                                     int x = w * 16 + px;
                                     var pixel = rawImage[x, y];
                                     float val = c == 0 ? pixel.R : (c == 1 ? pixel.G : pixel.B);
-                                    float normVal = (val / 127.5f) - 1.0f;
+                                    float normVal = (val / 255.0f - mean[c]) / std[c];
 
-                                    pixelValues[patchBase + 0 * (3 * 16 * 16) + c * (16 * 16) + py * 16 + px] = normVal;
-                                    pixelValues[patchBase + 1 * (3 * 16 * 16) + c * (16 * 16) + py * 16 + px] = normVal;
+                                    // Layout [C, T, H, W] where T=2 (Qwen2-VL 3D patch embedding)
+                                    pixelValues[patchBase + c * (2 * 16 * 16) + 0 * (16 * 16) + py * 16 + px] = normVal;
+                                    pixelValues[patchBase + c * (2 * 16 * 16) + 1 * (16 * 16) + py * 16 + px] = normVal;
                                 }
                             }
                         }
@@ -1496,6 +1705,124 @@ public class Qwen3VLPipeline : IDisposable
         return (visualEmbeds, deepstackFeatures, gridT, pH, pW);
     }
 
+    private double GetVideoDuration(string path)
+    {
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "ffprobe",
+                Arguments = $"-v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 \"{path}\"",
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var process = Process.Start(startInfo);
+            if (process == null) return 1.0;
+            string output = process.StandardOutput.ReadToEnd();
+            process.WaitForExit();
+            if (double.TryParse(output.Trim(), out double duration)) return duration;
+        }
+        catch { }
+        return 1.0; // Fallback
+    }
+
+    private (nint embeds, nint deepstack, int t, int h, int w) ProcessVideo(string videoPath, int maxFrames = 8, bool silent = false)
+    {
+        string tmpDir = Path.Combine(Path.GetTempPath(), "Qwen3VL_Vid_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tmpDir);
+        try
+        {
+            double duration = GetVideoDuration(videoPath);
+            double fps = maxFrames / Math.Max(0.1, duration);
+            if (!silent) Console.WriteLine($"[Info] Extracting {maxFrames} frames (duration: {duration:F2}s, fps: {fps:F2})...");
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "ffmpeg",
+                Arguments = $"-y -i \"{videoPath}\" -vf \"fps={fps:F4}\" -vframes {maxFrames} \"{tmpDir}/f_%03d.jpg\"",
+                RedirectStandardError = false,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using (var process = Process.Start(startInfo))
+            {
+                if (process == null) throw new Exception("Failed to start FFmpeg.");
+                process.WaitForExit();
+            }
+
+            string[] frames = Directory.GetFiles(tmpDir, "*.jpg").OrderBy(f => f).ToArray();
+            if (frames.Length == 0) throw new Exception("FFmpeg frame extraction failed.");
+
+            List<float[]> allE = new();
+            List<float[]> allD = new();
+            int gH = 0, gW = 0, hidden = _hiddenSize, visHidden = _visionHiddenSize;
+
+            int frameIdx = 1;
+            foreach (var f in frames)
+            {
+                if (!silent) Console.WriteLine($"  - Processing frame {frameIdx}/{frames.Length}...");
+                var (eT, dT, _, h, w) = ProcessImage(f, silent);
+                gH = h; gW = w;
+                frameIdx++;
+
+                NativeMethods.ov_tensor_get_size(eT, out nuint eSz);
+                float[] eA = new float[(int)eSz];
+                NativeMethods.ov_tensor_data(eT, out nint eP);
+                Marshal.Copy(eP, eA, 0, eA.Length);
+                allE.Add(eA);
+
+                NativeMethods.ov_tensor_get_size(dT, out nuint dSz);
+                float[] dA = new float[(int)dSz];
+                NativeMethods.ov_tensor_data(dT, out nint dP);
+                Marshal.Copy(dP, dA, 0, dA.Length);
+                allD.Add(dA);
+
+                NativeMethods.ov_tensor_free(eT);
+                NativeMethods.ov_tensor_free(dT);
+            }
+
+            // Combine Embeds
+            int totalTokens = allE.Sum(a => a.Length / hidden);
+            float[] combE = new float[totalTokens * hidden];
+            int offE = 0;
+            foreach (var a in allE) { Array.Copy(a, 0, combE, offE, a.Length); offE += a.Length; }
+
+            CheckStatus(NativeMethods.ov_shape_create(3, new long[] { 1, totalTokens, hidden }, out var sE), "Vid eShape");
+            CheckStatus(NativeMethods.ov_tensor_create(OvElementType.F32, sE, out nint tE), "Vid eTensor");
+            NativeMethods.ov_tensor_data(tE, out nint pE);
+            Marshal.Copy(combE, 0, pE, combE.Length);
+
+            // Combine Deepstack
+            // The deepstack features from Merger have the SAME hidden size as the LLM (hidden), not visHidden.
+            int totalVisTokens = allD.Sum(a => a.Length / (3 * hidden));
+            if (!silent) Console.WriteLine($"[Debug] Combined Deepstack: totalVisTokens={totalVisTokens}, hidden={hidden}");
+
+            float[] combD = new float[3 * totalVisTokens * hidden];
+            for (int l = 0; l < 3; l++)
+            {
+                int offDL = l * totalVisTokens * hidden;
+                int nDone = 0;
+                foreach (var a in allD)
+                {
+                    int n = a.Length / (3 * hidden);
+                    Array.Copy(a, l * n * hidden, combD, offDL + nDone * hidden, n * hidden);
+                    nDone += n;
+                }
+            }
+
+            CheckStatus(NativeMethods.ov_shape_create(3, new long[] { 3, totalVisTokens, hidden }, out var sD), "Vid dShape");
+            CheckStatus(NativeMethods.ov_tensor_create(OvElementType.F32, sD, out nint tD), "Vid dTensor");
+            NativeMethods.ov_tensor_data(tD, out nint pD);
+            Marshal.Copy(combD, 0, pD, combD.Length);
+
+            return (tE, tD, frames.Length, gH, gW);
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, true); } catch { }
+        }
+    }
+
     private float[] CalculateVisionRoPE(int numPatches, int unpooledW, int dim)
     {
         int halfDim = dim / 2;
@@ -1563,6 +1890,13 @@ public class Qwen3VLPipeline : IDisposable
         OvDimension[] dims = new OvDimension[rank];
         for (int i = 0; i < rank; i++) dims[i] = Marshal.PtrToStructure<OvDimension>(shape.Dims + i * Marshal.SizeOf<OvDimension>());
         return "[" + string.Join(", ", dims.Select(d => d.Min == d.Max ? d.Min.ToString() : (d.Max == -1 ? $"{d.Min}..?" : $"{d.Min}..{d.Max}"))) + "]";
+    }
+
+    public string DecodeOnly(List<int> ids)
+    {
+        if (ids == null || ids.Count == 0) return "";
+        uint[] uids = ids.Select(x => (uint)x).ToArray();
+        return _tokenizer.Decode(uids, skipSpecialTokens: true);
     }
 
     public void Dispose()

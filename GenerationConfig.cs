@@ -15,4 +15,5 @@ public class GenerationConfig
     public float FrequencyPenalty { get; set; } = 0.0f;
     public int ContextWindow { get; set; } = 4096;
     public List<string> StopSequences { get; set; } = new();
+    public string Mode { get; set; } = "chat"; // Options: chat, computer_use, 2d_grounding, mobile_agent
 }

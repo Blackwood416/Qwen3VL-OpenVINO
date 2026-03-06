@@ -1,0 +1,142 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Qwen3-VL | Vision Intelligence</title>
+    <!-- Dependencies -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/8.0.0/signalr.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    
+    <link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+    <aside id="sidebar">
+        <div class="brand"><div class="brand-logo"><i class="fas fa-brain"></i></div><div class="brand-name" style="margin-left: 10px; font-weight: 700;">Qwen3-VL</div></div>
+        <button class="new-chat-btn" onclick="createNewSession()"><i class="fas fa-plus"></i> 新会话</button>
+        <div id="session-list"></div>
+    </aside>
+
+    <main id="main">
+        <header>
+            <div style="display: flex; align-items: center; gap: 1rem;">
+                <div style="font-weight: 600;">Qwen3-VL Vision AI</div>
+                <div id="status" style="font-size: 0.75rem; color: #10b981;"><i class="fas fa-circle"></i> 就绪</div>
+            </div>
+            <button class="icon-btn" onclick="toggleSettings()"><i class="fas fa-sliders-h"></i></button>
+        </header>
+        <aside id="settings-sidebar">
+            <div class="settings-header">
+                <h3 style="font-size: 1rem;">Generation Config</h3>
+                <button class="icon-btn" onclick="toggleSettings()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="config-group">
+                <div class="config-label"><span>Temperature</span><span id="val-temp">0.7</span></div>
+            <input type="range" id="cfg-temp" min="0.1" max="2.0" step="0.1" value="0.7" oninput="updateCfg('temp', this.value)">
+        </div>
+        <div class="config-group">
+            <div class="config-label"><span>Top P</span><span id="val-topp">0.8</span></div>
+            <input type="range" id="cfg-topp" min="0.0" max="1.0" step="0.05" value="0.8" oninput="updateCfg('topp', this.value)">
+        </div>
+        <div class="config-group">
+            <div class="config-label"><span>Top K</span><span id="val-topk">20</span></div>
+            <input type="range" id="cfg-topk" min="0" max="100" step="1" value="20" oninput="updateCfg('topk', this.value)">
+        </div>
+        <div class="config-group">
+            <div class="config-label"><span>Repetition Penalty</span><span id="val-rep">1.0</span></div>
+            <input type="range" id="cfg-rep" min="1.0" max="2.0" step="0.05" value="1.0" oninput="updateCfg('rep', this.value)">
+        </div>
+        <div class="config-group">
+            <div class="config-label"><span>Presence Penalty</span><span id="val-pres">1.5</span></div>
+            <input type="range" id="cfg-pres" min="0.0" max="2.0" step="0.1" value="1.5" oninput="updateCfg('pres', this.value)">
+        </div>
+        <div class="config-group">
+            <div class="config-label"><span>Frequency Penalty</span><span id="val-freq">0.0</span></div>
+            <input type="range" id="cfg-freq" min="0.0" max="2.0" step="0.1" value="0.0" oninput="updateCfg('freq', this.value)">
+        </div>
+        <div class="config-group" style="flex-direction: row; align-items: center; justify-content: space-between;">
+            <div class="config-label" style="margin-bottom: 0;"><span>Greedy Search</span></div>
+            <input type="checkbox" id="cfg-greedy" onchange="updateCfg('greedy', this.checked)" style="width: 16px; height: 16px; cursor: pointer;">
+        </div>
+        <div class="config-group">
+            <div class="config-label"><span>Max Tokens</span></div>
+            <input type="number" id="cfg-max" value="512" min="1" max="8192" onchange="updateCfg('max', this.value)">
+        </div>
+        <div class="config-group">
+            <div class="config-label"><span>Context Window</span></div>
+            <input type="number" id="cfg-ctx" value="4096" min="1024" max="32768" onchange="updateCfg('ctx', this.value)">
+        </div>
+        <div class="config-group">
+            <div class="config-label"><span>Stop Sequences (Split by ,)</span></div>
+            <input type="text" id="cfg-stop" placeholder="e.g. <|endoftext|>" onchange="updateCfg('stop', this.value)" style="background: #1a1a1a; border: 1px solid #333; color: white; padding: 0.4rem; border-radius: 6px; font-size: 0.8rem; outline: none;">
+        </div>
+        </aside>
+        <div id="overlay" class="overlay" onclick="toggleSettings()"></div>
+        <div id="chat-container">
+            <div id="welcome-screen" class="welcome-screen">
+                <div class="welcome-header">
+                    <h1>Hello, I'm Qwen3-VL 👋</h1>
+                    <p>How can I help you today? Choose a mode to get started.</p>
+                </div>
+                <div class="mode-cards">
+                    <div class="mode-card active" id="card-chat" onclick="setMode('chat')">
+                        <div class="mode-icon"><i class="fas fa-comments"></i></div>
+                        <h3>Vision Chat</h3>
+                        <p>General multimodal conversations, QA, and visual understanding.</p>
+                    </div>
+                    <div class="mode-card" id="card-computer_use" onclick="setMode('computer_use')">
+                        <div class="mode-icon"><i class="fas fa-desktop"></i></div>
+                        <h3>Computer Use</h3>
+                        <p>Interact with UI elements and automate visual desktop tasks.</p>
+                    </div>
+                    <div class="mode-card" id="card-2d_grounding" onclick="setMode('2d_grounding')">
+                        <div class="mode-icon"><i class="fas fa-crop-simple"></i></div>
+                        <h3>2D Grounding</h3>
+                        <p>Detect objects, locate specific regions, and draw bounding boxes.</p>
+                    </div>
+                    <div class="mode-card" id="card-ocr" onclick="setMode('ocr')">
+                        <div class="mode-icon"><i class="fas fa-font"></i></div>
+                        <h3>OCR 文字识别</h3>
+                        <p>Full-page text extraction, multilingual recognition, and text spotting with location.</p>
+                    </div>
+                    <div class="mode-card" id="card-doc_parsing" onclick="setMode('doc_parsing')">
+                        <div class="mode-icon"><i class="fas fa-file-code"></i></div>
+                        <h3>Document Parsing</h3>
+                        <p>Convert document images to HTML, Markdown, or LaTeX with positional information.</p>
+                    </div>
+                    <div class="mode-card" id="card-spatial" onclick="setMode('spatial')">
+                        <div class="mode-icon"><i class="fas fa-compass"></i></div>
+                        <h3>Spatial Understanding</h3>
+                        <p>Understand spatial relationships, perceive affordances, and plan actions.</p>
+                    </div>
+                    <div class="mode-card" id="card-omni_recognition" onclick="setMode('omni_recognition')">
+                        <div class="mode-icon"><i class="fas fa-magnifying-glass"></i></div>
+                        <h3>Omni Recognition</h3>
+                        <p>Recognize celebrities, anime characters, products, landmarks, animals, and plants.</p>
+                    </div>
+                </div>
+            </div>
+            <div class="chat-wrapper" id="chat-wrapper" style="display: none;"></div>
+        </div>
+        <footer class="footer">
+            <div class="input-area">
+                <div id="preview-strip" class="preview-strip" style="display: none;"></div>
+                <div class="input-row">
+                    <button class="icon-btn" onclick="document.getElementById('file-input').click()"><i class="fas fa-paperclip"></i></button>
+                    <input type="file" id="file-input" accept="image/*,video/*" onchange="handleFile(this)">
+                    <textarea id="user-input" placeholder="输入并询问..." rows="1" oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px'"></textarea>
+                    <button id="send-btn" class="icon-btn send-btn" onclick="send()"><i class="fas fa-arrow-up"></i></button>
+                    <button id="stop-btn" class="icon-btn stop-btn" onclick="stop()"><i class="fas fa-stop"></i></button>
+                </div>
+            </div>
+        </footer>
+    </main>
+
+    <script src="/js/app.js"></script>
+</body>
+</html>
+
